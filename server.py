@@ -711,6 +711,20 @@ class FileServer(ThreadingHTTPServer):
                 self.active_requests.discard(request)
             self.slots.release()
 
+    def handle_error(self, request, client_address):
+        """Ignore routine client disconnects, including during HTTP parsing.
+
+        BaseHTTPRequestHandler can raise before dispatch() (for example while
+        sending a 501 response for an unsupported HTTP method). Such errors
+        cannot be caught by Handler.handle_method(). Keep unexpected errors
+        visible via the standard server error handler.
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
     def maintenance(self):
         while not self.stop_event.wait(15):
             self.jobs.sweep()
@@ -1791,6 +1805,48 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(content.decode('utf-8'), 'سلام دنیا')
         self.assertIn("filename*=UTF-8''%", headers['Content-Disposition'])
         self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
+
+    def test_unsupported_http_method_returns_501(self):
+        status, _, _ = self.request('/', method='UNKNOWNMETHOD')
+        self.assertEqual(status, 501)
+        # The request thread must not affect subsequent requests.
+        self.assertEqual(self.request('/api/list')[0], 200)
+
+    def test_disconnect_during_unsupported_method_is_silent(self):
+        from unittest.mock import patch
+
+        handled = threading.Event()
+        errors = []
+        original_handle_error = self.server.handle_error
+
+        def observed_handle_error(request, client_address):
+            try:
+                original_handle_error(request, client_address)
+            finally:
+                handled.set()
+
+        def broken_response(handler, *args, **kwargs):
+            raise BrokenPipeError(errno.EPIPE, 'client disconnected')
+
+        with (patch.object(self.server, 'handle_error', side_effect=observed_handle_error),
+              patch.object(Handler, 'send_error', broken_response),
+              patch('sys.stderr', new_callable=io.StringIO) as stderr):
+            with socket.create_connection(('127.0.0.1', self.server.server_port), timeout=3) as conn:
+                conn.sendall(b'UNKNOWNMETHOD / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+            self.assertTrue(handled.wait(3), 'Request error handler was not invoked')
+            errors.append(stderr.getvalue())
+        self.assertEqual(errors, [''])
+        self.assertEqual(self.request('/api/list')[0], 200)
+
+    def test_unexpected_request_exception_still_reports_traceback(self):
+        from unittest.mock import patch
+
+        with patch('sys.stderr', new_callable=io.StringIO) as stderr:
+            try:
+                raise RuntimeError('unexpected server bug')
+            except RuntimeError:
+                self.server.handle_error(None, ('127.0.0.1', 12345))
+        self.assertIn('RuntimeError: unexpected server bug', stderr.getvalue())
 
     def test_html_and_csp(self):
         status, headers, raw = self.request('/')
