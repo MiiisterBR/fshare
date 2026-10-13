@@ -1,0 +1,7 @@
+# Publish only the standalone application, documentation and this allowlist.
+# This excludes personal files, credentials, AGENTS.md, .aws/, .env files,
+# browser profiles, fixtures, caches, logs, build output and temporary archives.
+/*
+!/server.py
+!/README.md
+!/.gitignore
